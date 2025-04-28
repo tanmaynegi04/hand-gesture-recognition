@@ -1,11 +1,42 @@
 import streamlit as st
-import cv2
 import numpy as np
 import time
 import tensorflow as tf
-from tensorflow.keras.models import load_model
-import mediapipe as mp
 from collections import deque
+import os
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Import opencv with better error handling
+try:
+    import cv2
+    logger.info("OpenCV imported successfully")
+except ImportError as e:
+    st.error(f"Error importing OpenCV: {e}")
+    st.error("Please make sure opencv-python-headless is installed.")
+
+# Import mediapipe with better error handling
+try:
+    import mediapipe as mp
+    logger.info("MediaPipe imported successfully")
+except ImportError as e:
+    st.error(f"Error importing MediaPipe: {e}")
+    st.error("Please make sure mediapipe is installed.")
+
+# Display app information and environment details
+st.sidebar.markdown("## Environment Info")
+st.sidebar.write(f"TensorFlow version: {tf.__version__}")
+try:
+    st.sidebar.write(f"OpenCV version: {cv2.__version__}")
+except:
+    st.sidebar.write("OpenCV not available")
+try:
+    st.sidebar.write(f"MediaPipe version: {mp.__version__}")
+except:
+    st.sidebar.write("MediaPipe not available")
 
 # Set page configuration
 st.set_page_config(
@@ -44,6 +75,13 @@ st.markdown("""
         background-color: #4CAF50;
         color: white;
     }
+    .error-box {
+        background-color: #ffcccc;
+        color: #990000;
+        padding: 10px;
+        border-radius: 5px;
+        margin-bottom: 20px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -56,34 +94,58 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Initialize MediaPipe Hands
+# Cloud deployment detection
+is_cloud = os.environ.get('STREAMLIT_CLOUD', '') or 'HOSTED' in os.environ
+if is_cloud:
+    st.info("Running in cloud environment. Camera functionality may be limited.")
+
+# Initialize MediaPipe Hands with proper error handling
 @st.cache_resource
 def load_mediapipe():
-    mp_hands = mp.solutions.hands
-    mp_drawing = mp.solutions.drawing_utils
-    mp_drawing_styles = mp.solutions.drawing_styles
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    )
-    return mp_hands, mp_drawing, mp_drawing_styles, hands
+    try:
+        mp_hands = mp.solutions.hands
+        mp_drawing = mp.solutions.drawing_utils
+        mp_drawing_styles = mp.solutions.drawing_styles
+        hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        return mp_hands, mp_drawing, mp_drawing_styles, hands, True
+    except Exception as e:
+        logger.error(f"Error initializing MediaPipe: {e}")
+        return None, None, None, None, False
 
-mp_hands, mp_drawing, mp_drawing_styles, hands = load_mediapipe()
+# Load MediaPipe
+mp_hands, mp_drawing, mp_drawing_styles, hands, mediapipe_loaded = load_mediapipe()
+if not mediapipe_loaded:
+    st.warning("MediaPipe could not be initialized. Hand detection will not be available.")
 
-# Load the model
+# Load the model with better error handling
 @st.cache_resource
 def load_asl_model():
     try:
         with st.spinner("Loading ASL recognition model..."):
-            model = load_model("asl_model.h5")
+            model_path = "asl_model.h5"
+            if not os.path.exists(model_path):
+                st.warning(f"Model file {model_path} not found. Looking for alternative models...")
+                # Try alternative model name
+                alt_model_path = "asl_model_advanced.h5"
+                if os.path.exists(alt_model_path):
+                    model_path = alt_model_path
+                    st.info(f"Using alternative model: {alt_model_path}")
+                else:
+                    return None, False, "Model file not found"
+            
+            logger.info(f"Loading model from {model_path}")
+            model = tf.keras.models.load_model(model_path)
             st.success("Model loaded successfully!")
-            return model
+            return model, True, None
     except Exception as e:
-        st.error(f"Error loading model: {e}")
-        st.error("Please make sure the model file exists in the same directory as this app.")
-        return None
+        error_msg = f"Error loading model: {str(e)}"
+        logger.error(error_msg)
+        return None, False, error_msg
 
 # ASL Labels
 labels = [
@@ -109,6 +171,8 @@ if 'is_camera_on' not in st.session_state:
     st.session_state.is_camera_on = False
 if 'fps_history' not in st.session_state:
     st.session_state.fps_history = deque(maxlen=30)
+if 'camera_error' not in st.session_state:
+    st.session_state.camera_error = None
 
 # Constants
 img_size = 96  # Match model input size from training
@@ -117,85 +181,97 @@ confidence_threshold = 0.6  # Minimum confidence to accept a prediction
 # Helper functions
 def crop_hand_region(frame, landmarks):
     """Extract hand region from the frame based on MediaPipe landmarks"""
-    # Get coordinates for hand bounding box
-    x_coords = [landmark.x for landmark in landmarks]
-    y_coords = [landmark.y for landmark in landmarks]
-    
-    # Add padding around the hand
-    padding = 0.15
-    
-    # Calculate the bounding box with padding
-    x_min = max(0, int(min(x_coords) * frame.shape[1] - padding * frame.shape[1]))
-    y_min = max(0, int(min(y_coords) * frame.shape[0] - padding * frame.shape[0]))
-    x_max = min(frame.shape[1], int(max(x_coords) * frame.shape[1] + padding * frame.shape[1]))
-    y_max = min(frame.shape[0], int(max(y_coords) * frame.shape[0] + padding * frame.shape[0]))
-    
-    # Ensure we have a square crop (important for ASL signs)
-    width = x_max - x_min
-    height = y_max - y_min
-    max_dim = max(width, height)
-    
-    # Center the crop box
-    center_x = (x_min + x_max) // 2
-    center_y = (y_min + y_max) // 2
-    
-    # Get the new coordinates for a square crop
-    x_min = max(0, center_x - max_dim // 2)
-    y_min = max(0, center_y - max_dim // 2)
-    x_max = min(frame.shape[1], x_min + max_dim)
-    y_max = min(frame.shape[0], y_min + max_dim)
-    
-    # Return the cropped hand region and the bounding box coordinates
-    if x_max > x_min and y_max > y_min:
-        return frame[y_min:y_max, x_min:x_max], (x_min, y_min, x_max, y_max)
-    else:
+    try:
+        # Get coordinates for hand bounding box
+        x_coords = [landmark.x for landmark in landmarks]
+        y_coords = [landmark.y for landmark in landmarks]
+        
+        # Add padding around the hand
+        padding = 0.15
+        
+        # Calculate the bounding box with padding
+        x_min = max(0, int(min(x_coords) * frame.shape[1] - padding * frame.shape[1]))
+        y_min = max(0, int(min(y_coords) * frame.shape[0] - padding * frame.shape[0]))
+        x_max = min(frame.shape[1], int(max(x_coords) * frame.shape[1] + padding * frame.shape[1]))
+        y_max = min(frame.shape[0], int(max(y_coords) * frame.shape[0] + padding * frame.shape[0]))
+        
+        # Ensure we have a square crop (important for ASL signs)
+        width = x_max - x_min
+        height = y_max - y_min
+        max_dim = max(width, height)
+        
+        # Center the crop box
+        center_x = (x_min + x_max) // 2
+        center_y = (y_min + y_max) // 2
+        
+        # Get the new coordinates for a square crop
+        x_min = max(0, center_x - max_dim // 2)
+        y_min = max(0, center_y - max_dim // 2)
+        x_max = min(frame.shape[1], x_min + max_dim)
+        y_max = min(frame.shape[0], y_min + max_dim)
+        
+        # Return the cropped hand region and the bounding box coordinates
+        if x_max > x_min and y_max > y_min:
+            return frame[y_min:y_max, x_min:x_max], (x_min, y_min, x_max, y_max)
+        else:
+            return None, (0, 0, 0, 0)
+    except Exception as e:
+        logger.error(f"Error in crop_hand_region: {e}")
         return None, (0, 0, 0, 0)
 
 def preprocess_image(img):
     """Preprocess the image for model prediction"""
-    if img is None or img.size == 0:
+    try:
+        if img is None or img.size == 0:
+            return None
+        
+        # Resize to model's expected input size
+        img = cv2.resize(img, (img_size, img_size))
+        
+        # Convert to RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Normalize pixel values
+        img = img.astype('float32') / 255.0
+        
+        # Add batch dimension
+        img = np.expand_dims(img, axis=0)
+        
+        return img
+    except Exception as e:
+        logger.error(f"Error in preprocess_image: {e}")
         return None
-    
-    # Resize to model's expected input size
-    img = cv2.resize(img, (img_size, img_size))
-    
-    # Convert to RGB
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    
-    # Normalize pixel values
-    img = img.astype('float32') / 255.0
-    
-    # Add batch dimension
-    img = np.expand_dims(img, axis=0)
-    
-    return img
 
 def get_stable_prediction():
     """Get a stable prediction from the history"""
-    if not st.session_state.prediction_history:
-        return "unknown", 0.0
-    
-    # Count predictions
-    prediction_counts = {}
-    confidence_sums = {}
-    
-    for pred, conf in st.session_state.prediction_history:
-        if pred in prediction_counts:
-            prediction_counts[pred] += 1
-            confidence_sums[pred] += conf
+    try:
+        if not st.session_state.prediction_history:
+            return "unknown", 0.0
+        
+        # Count predictions
+        prediction_counts = {}
+        confidence_sums = {}
+        
+        for pred, conf in st.session_state.prediction_history:
+            if pred in prediction_counts:
+                prediction_counts[pred] += 1
+                confidence_sums[pred] += conf
+            else:
+                prediction_counts[pred] = 1
+                confidence_sums[pred] = conf
+        
+        # Get most frequent prediction with highest confidence
+        most_frequent = max(prediction_counts, key=prediction_counts.get)
+        average_confidence = confidence_sums[most_frequent] / prediction_counts[most_frequent]
+        
+        # Only return if confidence is above threshold
+        if average_confidence >= confidence_threshold:
+            return most_frequent, average_confidence
         else:
-            prediction_counts[pred] = 1
-            confidence_sums[pred] = conf
-    
-    # Get most frequent prediction with highest confidence
-    most_frequent = max(prediction_counts, key=prediction_counts.get)
-    average_confidence = confidence_sums[most_frequent] / prediction_counts[most_frequent]
-    
-    # Only return if confidence is above threshold
-    if average_confidence >= confidence_threshold:
-        return most_frequent, average_confidence
-    else:
-        return "unknown", average_confidence
+            return "unknown", average_confidence
+    except Exception as e:
+        logger.error(f"Error in get_stable_prediction: {e}")
+        return "unknown", 0.0
 
 def reset_text():
     """Reset the display text"""
@@ -204,6 +280,7 @@ def reset_text():
 def toggle_camera():
     """Toggle the camera on/off state"""
     st.session_state.is_camera_on = not st.session_state.is_camera_on
+    st.session_state.camera_error = None  # Reset camera error state
     if not st.session_state.is_camera_on:
         # Reset states when turning off
         st.session_state.prediction_history.clear()
@@ -211,7 +288,11 @@ def toggle_camera():
         st.session_state.letter_confirmed = False
 
 # Load model when the app starts
-model = load_asl_model()
+model, model_loaded, model_error = load_asl_model()
+
+if not model_loaded:
+    st.error(f"Failed to load model: {model_error}")
+    st.warning("Demo mode only: The app will run with limited functionality.")
 
 # UI Layout
 col1, col2 = st.columns([3, 1])
@@ -269,26 +350,33 @@ with col2:
 
 # Main area for webcam display
 with col1:
+    # Show camera error if exists
+    if st.session_state.camera_error:
+        st.error(f"Camera Error: {st.session_state.camera_error}")
+    
     # Placeholder for webcam feed
     video_placeholder = st.empty()
 
     # Only run the webcam if toggled on and model is loaded
-    if st.session_state.is_camera_on and model is not None:
+    if st.session_state.is_camera_on:
         # Create a frame placeholder
         frame_placeholder = video_placeholder.empty()
         
-        # Start webcam capture
-        cap = cv2.VideoCapture(0)
-        
-        # Set camera properties if supported
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        
-        # Check if camera opened successfully
-        if not cap.isOpened():
-            st.error("Error: Could not open webcam")
-            st.session_state.is_camera_on = False
-        else:
+        # Start webcam capture with better error handling
+        try:
+            cap = cv2.VideoCapture(0)
+            
+            # Set camera properties if supported
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            
+            # Check if camera opened successfully
+            if not cap.isOpened():
+                raise Exception("Could not open webcam. Browser might not support camera access in this environment.")
+            
+            # Camera successfully opened, proceed
+            logger.info("Camera initialized successfully")
+            
             # FPS calculation
             prev_frame_time = time.time()
             
@@ -297,7 +385,7 @@ with col1:
                     # Read frame
                     ret, frame = cap.read()
                     if not ret:
-                        st.error("Failed to capture image from webcam")
+                        st.session_state.camera_error = "Failed to capture image from webcam"
                         break
                     
                     # Calculate FPS
@@ -312,71 +400,77 @@ with col1:
                     # Convert to RGB for MediaPipe
                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     
-                    # Process with MediaPipe
-                    results = hands.process(rgb_frame)
-                    
-                    # Process hand landmarks if detected
+                    # Process with MediaPipe if available
                     hand_detected = False
-                    if results.multi_hand_landmarks:
-                        hand_detected = True
-                        for hand_landmarks in results.multi_hand_landmarks:
-                            # Draw landmarks on the frame
-                            mp_drawing.draw_landmarks(
-                                frame, 
-                                hand_landmarks, 
-                                mp_hands.HAND_CONNECTIONS,
-                                mp_drawing_styles.get_default_hand_landmarks_style(),
-                                mp_drawing_styles.get_default_hand_connections_style()
-                            )
-                            
-                            # Extract the hand region based on landmarks
-                            hand_img, (x_min, y_min, x_max, y_max) = crop_hand_region(frame, hand_landmarks.landmark)
-                            
-                            if hand_img is not None:
-                                # Draw bounding box around hand
-                                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                    if mediapipe_loaded and hands is not None:
+                        results = hands.process(rgb_frame)
+                        
+                        # Process hand landmarks if detected
+                        if results.multi_hand_landmarks:
+                            hand_detected = True
+                            for hand_landmarks in results.multi_hand_landmarks:
+                                # Draw landmarks on the frame
+                                mp_drawing.draw_landmarks(
+                                    frame, 
+                                    hand_landmarks, 
+                                    mp_hands.HAND_CONNECTIONS,
+                                    mp_drawing_styles.get_default_hand_landmarks_style(),
+                                    mp_drawing_styles.get_default_hand_connections_style()
+                                )
                                 
-                                # Preprocess the hand image for the model
-                                processed_img = preprocess_image(hand_img)
+                                # Extract the hand region based on landmarks
+                                hand_img, (x_min, y_min, x_max, y_max) = crop_hand_region(frame, hand_landmarks.landmark)
                                 
-                                if processed_img is not None:
-                                    # Make prediction
-                                    preds = model.predict(processed_img, verbose=0)
+                                if hand_img is not None:
+                                    # Draw bounding box around hand
+                                    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
                                     
-                                    # Get top prediction
-                                    idx = np.argmax(preds[0])
-                                    confidence = preds[0][idx]
-                                    
-                                    # Add to prediction history only if confidence is above minimum threshold
-                                    if confidence > 0.3:  # Lower threshold for adding to history
-                                        st.session_state.prediction_history.append((labels[idx], confidence))
-                                    
-                                    # Get stable prediction
-                                    pred_letter, pred_confidence = get_stable_prediction()
-                                    
-                                    # Update current prediction
-                                    if pred_letter != "unknown":
-                                        st.session_state.current_letter = pred_letter
-                                        st.session_state.current_confidence = pred_confidence
+                                    # Only process if model is loaded
+                                    if model_loaded and model is not None:
+                                        # Preprocess the hand image for the model
+                                        processed_img = preprocess_image(hand_img)
                                         
-                                        # Start timing for confirmation
-                                        if st.session_state.detection_start_time is None:
-                                            st.session_state.detection_start_time = time.time()
-                                        
-                                        # Confirm letter after holding for 1 second
-                                        elapsed = time.time() - st.session_state.detection_start_time
-                                        if elapsed > 1.0 and not st.session_state.letter_confirmed:
-                                            st.session_state.letter_confirmed = True
-                                            if pred_letter == "space":
-                                                st.session_state.display_text += " "
-                                            elif pred_letter == "del" and st.session_state.display_text:
-                                                st.session_state.display_text = st.session_state.display_text[:-1]
-                                            elif pred_letter != "nothing":
-                                                st.session_state.display_text += pred_letter
-                                    else:
-                                        # Reset detection timer if prediction changes
-                                        st.session_state.detection_start_time = None
-                                        st.session_state.letter_confirmed = False
+                                        if processed_img is not None:
+                                            try:
+                                                # Make prediction
+                                                preds = model.predict(processed_img, verbose=0)
+                                                
+                                                # Get top prediction
+                                                idx = np.argmax(preds[0])
+                                                confidence = preds[0][idx]
+                                                
+                                                # Add to prediction history only if confidence is above minimum threshold
+                                                if confidence > 0.3:  # Lower threshold for adding to history
+                                                    st.session_state.prediction_history.append((labels[idx], confidence))
+                                                
+                                                # Get stable prediction
+                                                pred_letter, pred_confidence = get_stable_prediction()
+                                                
+                                                # Update current prediction
+                                                if pred_letter != "unknown":
+                                                    st.session_state.current_letter = pred_letter
+                                                    st.session_state.current_confidence = pred_confidence
+                                                    
+                                                    # Start timing for confirmation
+                                                    if st.session_state.detection_start_time is None:
+                                                        st.session_state.detection_start_time = time.time()
+                                                    
+                                                    # Confirm letter after holding for 1 second
+                                                    elapsed = time.time() - st.session_state.detection_start_time
+                                                    if elapsed > 1.0 and not st.session_state.letter_confirmed:
+                                                        st.session_state.letter_confirmed = True
+                                                        if pred_letter == "space":
+                                                            st.session_state.display_text += " "
+                                                        elif pred_letter == "del" and st.session_state.display_text:
+                                                            st.session_state.display_text = st.session_state.display_text[:-1]
+                                                        elif pred_letter != "nothing":
+                                                            st.session_state.display_text += pred_letter
+                                                else:
+                                                    # Reset detection timer if prediction changes
+                                                    st.session_state.detection_start_time = None
+                                                    st.session_state.letter_confirmed = False
+                                            except Exception as e:
+                                                logger.error(f"Error in prediction: {e}")
                     
                     # Reset if no hand detected
                     if not hand_detected:
@@ -405,10 +499,18 @@ with col1:
                     time.sleep(0.01)
                     
             except Exception as e:
-                st.error(f"Error: {e}")
+                error_msg = f"Error during camera operation: {str(e)}"
+                logger.error(error_msg)
+                st.session_state.camera_error = error_msg
             finally:
                 # Release resources
                 cap.release()
+        except Exception as e:
+            error_msg = f"Camera initialization error: {str(e)}"
+            logger.error(error_msg)
+            st.session_state.camera_error = error_msg
+            video_placeholder.error("Could not access webcam. This feature may not be available in cloud environments.")
+            video_placeholder.image("https://via.placeholder.com/640x480.png?text=Camera+Not+Available", use_column_width=True)
     else:
         # Show placeholder when camera is off
         video_placeholder.image("https://via.placeholder.com/640x480.png?text=Camera+Off", use_column_width=True)
@@ -425,6 +527,7 @@ If you encounter issues:
 2. Allow browser camera access
 3. Try refreshing the page
 4. Ensure good lighting
+5. Note: Camera functionality may be limited in Streamlit Cloud
 """)
 
 # Add download button for the recognized text
@@ -435,3 +538,22 @@ if st.session_state.display_text:
         file_name="asl_recognized_text.txt",
         mime="text/plain"
     )
+
+# Display debug panel in sidebar
+with st.sidebar.expander("Debug Information"):
+    st.write("Runtime Environment:")
+    st.write(f"- Deployed in cloud: {is_cloud}")
+    st.write(f"- MediaPipe loaded: {mediapipe_loaded}")
+    st.write(f"- Model loaded: {model_loaded}")
+    if not model_loaded:
+        st.write(f"- Model error: {model_error}")
+    st.write(f"- Camera error: {st.session_state.camera_error}")
+    
+    # Add package information
+    st.write("Installed Packages:")
+    try:
+        import pkg_resources
+        pkg_list = sorted([f"{pkg.key}=={pkg.version}" for pkg in pkg_resources.working_set])
+        st.code("\n".join(pkg_list[:10] + ["..."]))
+    except:
+        st.write("Could not retrieve package information")
