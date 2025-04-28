@@ -131,7 +131,7 @@ def load_asl_model():
             if not os.path.exists(model_path):
                 st.warning(f"Model file {model_path} not found. Looking for alternative models...")
                 # Try alternative model name
-                alt_model_path = "asl_model_advanced.h5"
+                alt_model_path = "asl_model.h5"
                 if os.path.exists(alt_model_path):
                     model_path = alt_model_path
                     st.info(f"Using alternative model: {alt_model_path}")
