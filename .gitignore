@@ -1,0 +1,18 @@
+# Ignore virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Ignore model files if needed
+*.h5
+*.pb
+*.pkl
+
+# VSCode and system files
+.vscode/
+.DS_Store
+
+# Byte-compiled / cache
+*.pyo
+*.pyd
+*.pyc
